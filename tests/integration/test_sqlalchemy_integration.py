@@ -22,6 +22,7 @@ from sqlalchemy.sql import or_
 from sqlalchemy.types import ARRAY
 
 import trino.dbapi
+import trino.exceptions
 from tests.integration.conftest import trino_version
 from tests.unit.conftest import sqlalchemy_version
 from trino.sqlalchemy.datatype import JSON
@@ -681,6 +682,76 @@ def test_row_column(trino_connection, row_object, sqla_type):
         rows = result.fetchall()
         assert len(rows) == 1
         assert rows[0] == (1, row_object)
+    finally:
+        metadata.drop_all(engine)
+
+
+@pytest.mark.parametrize('trino_connection', ['memory'], indirect=True)
+@pytest.mark.parametrize(
+    'value,sqla_type',
+    [
+        ([], ARRAY(sqla.sql.sqltypes.String)),
+        ({}, MAP(sqla.sql.sqltypes.String, sqla.sql.sqltypes.Integer)),
+        (None, MAP(sqla.sql.sqltypes.String, sqla.sql.sqltypes.Integer)),
+        (
+            (None, None),
+            ROW([('field1', sqla.sql.sqltypes.String), ('field2', sqla.sql.sqltypes.Integer)]),
+        ),
+    ]
+)
+def test_empty_container_values_are_typed_by_the_dialect(trino_connection, value, sqla_type):
+    """Empty arrays, empty maps and all-NULL rows get their type from the column.
+
+    The caller must not need to hand-write a typed SQL literal for them.
+    """
+    engine, conn = trino_connection
+
+    if not engine.dialect.has_schema(conn, "test"):
+        with engine.begin() as connection:
+            connection.execute(sqla.schema.CreateSchema("test"))
+    metadata = sqla.MetaData()
+
+    try:
+        table = sqla.Table(
+            'table_with_typed_empty_container',
+            metadata,
+            sqla.Column('id', sqla.Integer),
+            sqla.Column('value', sqla_type),
+            schema="test",
+        )
+        metadata.create_all(engine)
+        conn.execute(table.insert(), {"id": 1, "value": value})
+        rows = conn.execute(sqla.select(table)).fetchall()
+        assert len(rows) == 1
+        assert rows[0] == (1, value)
+    finally:
+        metadata.drop_all(engine)
+
+
+@pytest.mark.parametrize('trino_connection', ['memory'], indirect=True)
+def test_decimal_precision_is_applied_to_bound_values(trino_connection):
+    engine, conn = trino_connection
+
+    if not engine.dialect.has_schema(conn, "test"):
+        with engine.begin() as connection:
+            connection.execute(sqla.schema.CreateSchema("test"))
+    metadata = sqla.MetaData()
+
+    try:
+        table = sqla.Table(
+            'table_with_typed_decimal',
+            metadata,
+            sqla.Column('id', sqla.Integer),
+            sqla.Column('value', sqla.sql.sqltypes.DECIMAL(6, 2)),
+            schema="test",
+        )
+        metadata.create_all(engine)
+        conn.execute(table.insert(), {"id": 1, "value": Decimal("1.25")})
+        rows = conn.execute(sqla.select(table)).fetchall()
+        assert rows[0] == (1, Decimal("1.25"))
+
+        with pytest.raises(trino.exceptions.TrinoParameterError, match="does not fit"):
+            conn.execute(table.insert(), {"id": 2, "value": Decimal("10000.00")})
     finally:
         metadata.drop_all(engine)
 

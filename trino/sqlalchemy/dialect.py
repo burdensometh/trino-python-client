@@ -493,7 +493,148 @@ class TrinoDialect(DefaultDialect):
     def do_execute(
         self, cursor: Cursor, statement: str, parameters: Tuple[Any, ...], context: DefaultExecutionContext = None
     ):
-        cursor.execute(statement, parameters)
+        typed = self._typed_parameters(context)
+        if typed is None:
+            cursor.execute(statement, parameters)
+        else:
+            cursor.execute(statement, parameters, typed=typed)
+
+    def do_executemany(
+        self, cursor: Cursor, statement: str, parameters: Sequence[Any], context: DefaultExecutionContext = None
+    ):
+        typed = self._typed_parameters(context)
+        if typed is None:
+            cursor.executemany(statement, parameters)
+        else:
+            cursor.executemany(statement, parameters, typed=typed)
+
+    def _typed_parameters(self, context: DefaultExecutionContext) -> Optional[List[Optional[str]]]:
+        """Derive a type declaration for every bound parameter.
+
+        Literal SQL emitted by the dialect describes the column type, so the
+        SQLAlchemy layer knows more about a bind value than the DBAPI can
+        infer on its own.  Declarations let the cursor validate values and
+        encode empty arrays, empty maps and all-``NULL`` rows with a ``CAST``
+        instead of relying on the caller to hand-write type SQL.
+
+        The returned list is aligned with the flattened parameter sequence,
+        which means expanded parameters (for example ``IN`` lists) repeat the
+        declaration of their parent bind once per element.  ``None`` is
+        returned when there is nothing to declare.
+        """
+        if context is None:
+            return None
+        compiled = getattr(context, "compiled", None)
+        if compiled is None:
+            return None
+        positiontup = getattr(compiled, "positiontup", None)
+        if not positiontup:
+            return None
+
+        binds = getattr(compiled, "binds", None) or {}
+        escaped_names = getattr(compiled, "escaped_bind_names", None) or {}
+        expanded = getattr(context, "_expanded_parameters", None) or {}
+
+        # escaped_bind_names maps an unquoted bind name to its quoted form. The
+        # PositionTuple contains whichever of the two SQLAlchemy used for this
+        # statement, so resolve in both directions.
+        unescape_names = {quoted: original for original, quoted in escaped_names.items()}
+
+        declarations: List[Optional[str]] = []
+        for name in positiontup:
+            bind = binds.get(name)
+            if bind is None:
+                bind = binds.get(escaped_names.get(name, name))
+            if bind is None:
+                bind = binds.get(unescape_names.get(name, name))
+            declaration = self._parameter_declaration(bind.type) if bind is not None else None
+            if name in expanded:
+                declarations.extend([declaration] * len(expanded[name]))
+            else:
+                declarations.append(declaration)
+
+        if not any(declaration is not None for declaration in declarations):
+            return None
+        return declarations
+
+    def _parameter_declaration(self, sql_type) -> Optional[str]:
+        """Return the declaration to hand to the DBAPI for a bound value.
+
+        Only structural types and decimals with an explicit precision get a
+        declaration.  Primitive binds keep the DBAPI's existing inference, so
+        values that Trino would coerce are still accepted, while arrays,
+        maps and rows - which the DBAPI cannot infer when empty or all
+        ``NULL`` - are declared explicitly.
+        """
+        if isinstance(sql_type, (sqltypes.ARRAY, datatype.MAP, datatype.ROW)):
+            return self._type_declaration(sql_type)
+        if isinstance(sql_type, sqltypes.Numeric) and not isinstance(sql_type, sqltypes.Float):
+            if getattr(sql_type, "precision", None) is not None:
+                return self._type_declaration(sql_type)
+        return None
+
+    def _type_declaration(self, sql_type) -> Optional[str]:
+        """Render a SQLAlchemy type as a Trino SQL type declaration.
+
+        Returns ``None`` for types that do not describe a value precisely
+        enough (for example ``NullType`` or an unparameterised ``DECIMAL``),
+        in which case the DBAPI keeps using its own inference.
+        """
+        if sql_type is None or isinstance(sql_type, sqltypes.NullType):
+            return None
+
+        if isinstance(sql_type, sqltypes.ARRAY):
+            item_type = sql_type.item_type
+            dimensions = sql_type.dimensions or 1
+            declaration = self._type_declaration(item_type)
+            if declaration is None:
+                return None
+            for _ in range(dimensions):
+                declaration = f"ARRAY({declaration})"
+            return declaration
+
+        if isinstance(sql_type, datatype.MAP):
+            key_type = self._type_declaration(sql_type.key_type)
+            value_type = self._type_declaration(sql_type.value_type)
+            if key_type is None or value_type is None:
+                return None
+            return f"MAP({key_type}, {value_type})"
+
+        if isinstance(sql_type, datatype.ROW):
+            fields = []
+            for name, attr_type in sql_type.attr_types:
+                declaration = self._type_declaration(attr_type)
+                if declaration is None:
+                    return None
+                if name is None:
+                    fields.append(declaration)
+                else:
+                    fields.append(f"{self.identifier_preparer.quote_identifier(name)} {declaration}")
+            return f"ROW({', '.join(fields)})"
+
+        if isinstance(sql_type, sqltypes.Numeric) and not isinstance(sql_type, sqltypes.Float):
+            precision = getattr(sql_type, "precision", None)
+            scale = getattr(sql_type, "scale", None)
+            if precision is None:
+                # Without a precision the type does not constrain the value,
+                # and casting to the default DECIMAL(38, 0) would round it.
+                return None
+            if scale is None:
+                scale = 0
+            return f"DECIMAL({precision}, {scale})"
+
+        try:
+            type_compiler = getattr(self, "type_compiler_instance", None) or self.type_compiler
+            if isinstance(type_compiler, type):
+                # SQLAlchemy 1.3 and 1.4 keep the compiler class on the
+                # dialect instead of an instance.
+                type_compiler = type_compiler(self)
+            declaration = type_compiler.process(sql_type)
+        except Exception:
+            return None
+        if not declaration or declaration.upper() in ("NULL", "NULLTYPE"):
+            return None
+        return declaration
 
     def do_rollback(self, dbapi_connection: trino_dbapi.Connection):
         if dbapi_connection.transaction is not None:

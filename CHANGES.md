@@ -6,6 +6,21 @@ list](https://github.com/trinodb/trino-python-client/tags), the
 [README](https://github.com/trinodb/trino-python-client/blob/master/README.md)
 and the [PyPI page](https://pypi.org/project/trino/).
 
+## Release 0.341.0
+
+* Add a `typed` argument to `Cursor.execute()` and `Cursor.executemany()` for
+  declaring the Trino type of query parameters, including recursive array,
+  map and named row types and decimal precision. Declare a type for parameters
+  whose type cannot be inferred, such as empty arrays, empty maps and rows whose
+  fields are all `NULL`; types are applied through `CAST` on both the
+  `EXECUTE IMMEDIATE` and legacy `PREPARE` paths. Values are validated before
+  the request is sent, and numeric overflow, mismatched row fields and duplicate
+  map keys report the full path of the offending value.
+* Raise `TrinoParameterError` instead of sending SQL when a parameter cannot be
+  encoded, including untyped empty arrays, empty maps and all-`NULL` rows.
+* Type bound values in the SQLAlchemy dialect from the column type, so arrays,
+  maps and rows are encoded without callers writing type SQL themselves.
+
 ## Release 0.340.0
 
 * Fix `AttributeError` when binding `bytes` values for `VARBINARY` columns,

@@ -78,6 +78,15 @@ class TrinoDataError(NotSupportedError):
     pass
 
 
+class TrinoParameterError(DataError):
+    """Raised when a query parameter cannot be encoded for the statement.
+
+    The exception message always includes the full path to the offending
+    value, for example ``params[0].keys[1]``, so that nested values can be
+    located without inspecting the whole parameter.
+    """
+
+
 class TrinoQueryError(Error):
     def __init__(self, error: Dict[str, Any], query_id: Optional[str] = None) -> None:
         self._error = error

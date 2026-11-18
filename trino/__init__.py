@@ -15,6 +15,7 @@ from . import constants
 from . import dbapi
 from . import exceptions
 from . import logging
+from . import sqltypes
 from ._version import __author__
 from ._version import __author_email__
 from ._version import __description__
@@ -30,6 +31,7 @@ __all__ = [
     "dbapi",
     "exceptions",
     "logging",
+    "sqltypes",
     "__author__",
     "__author_email__",
     "__description__",

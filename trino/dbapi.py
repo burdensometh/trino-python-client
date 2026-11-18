@@ -21,7 +21,10 @@ import datetime
 import math
 import uuid
 from collections import OrderedDict
+from collections.abc import Mapping
 from decimal import Decimal
+from decimal import localcontext
+from decimal import ROUND_HALF_UP
 from itertools import islice
 from threading import Lock
 from time import time
@@ -39,6 +42,7 @@ import trino.client
 import trino.exceptions
 import trino.logging
 from trino import constants
+from trino import sqltypes
 from trino.constants import LENGTH_TYPES
 from trino.constants import PRECISION_TYPES
 from trino.constants import SCALE_TYPES
@@ -520,35 +524,112 @@ class Cursor:
     def _execute_prepared_statement(
         self,
         statement_name,
-        params
+        params,
+        typed=None,
+        formatted_params=None,
     ):
-        sql = 'EXECUTE ' + statement_name + ' USING ' + ','.join(map(self._format_prepared_param, params))
+        if formatted_params is None:
+            formatted_params = self._format_params(params, typed)
+        sql = 'EXECUTE ' + statement_name + ' USING ' + ','.join(formatted_params)
         return trino.client.TrinoQuery(
             self._request,
             query=sql,
             legacy_primitive_types=self._legacy_primitive_types,
             stats_callback=self._stats_callback)
 
-    def _execute_immediate_statement(self, statement: str, params):
+    def _execute_immediate_statement(self, statement: str, params, typed=None):
         """
         Binds parameters and executes a statement in one call.
 
         :param statement: sql to be executed.
         :param params: parameters to be bound.
+        :param typed: optional type declarations, one per parameter.
         """
         sql = "EXECUTE IMMEDIATE '" + statement.replace("'", "''") + \
-              "' USING " + ",".join(map(self._format_prepared_param, params))
+              "' USING " + ",".join(self._format_params(params, typed))
         return trino.client.TrinoQuery(
             self.connection._create_request(),
             query=sql,
             legacy_primitive_types=self._legacy_primitive_types,
             stats_callback=self._stats_callback)
 
-    def _format_prepared_param(self, param):
+    def _format_params(self, params, typed=None):
+        """Format every parameter, applying the optional type declarations.
+
+        ``typed`` is either ``None`` or a sequence with exactly one entry per
+        parameter.  An entry is a type declaration (see :mod:`trino.sqltypes`)
+        or ``None`` when the parameter should be formatted as before.
+        """
+        if typed is None:
+            return [self._format_prepared_param(param, path=f"params[{index}]")
+                    for index, param in enumerate(params)]
+
+        typed = list(typed)
+        if len(typed) != len(params):
+            raise trino.exceptions.ProgrammingError(
+                "typed must have exactly one entry per parameter: "
+                f"got {len(typed)} type declarations for {len(params)} parameters"
+            )
+
+        return [
+            self._format_prepared_param(param, path=f"params[{index}]", sql_type=type_declaration)
+            for index, (param, type_declaration) in enumerate(zip(params, typed))
+        ]
+
+    def _format_prepared_param(self, param, path="params[0]", sql_type=None, cast_scalar=True):
         """
         Formats parameters to be passed in an
         EXECUTE statement.
+
+        :param param: the Python value to encode.
+        :param path: location of the value, used in error messages.
+        :param sql_type: optional declared :class:`trino.sqltypes.SqlType`.
+            Containers with a declaration are encoded with a ``CAST`` so that
+            empty arrays and empty maps get a known type.  Values of primitive
+            types are validated against the declaration, and wrapped in a
+            ``CAST`` when ``cast_scalar`` is true so the declared type is
+            actually applied.
+        :param cast_scalar: whether a primitive declaration should produce a
+            ``CAST``.  Elements of a declared container are already covered
+            by the container's own ``CAST``, so they are not wrapped again.
         """
+        if isinstance(param, sqltypes.Typed):
+            if sql_type is not None:
+                raise trino.exceptions.TrinoParameterError(
+                    f"{path}: a Typed value and an explicit type declaration cannot be combined"
+                )
+            sql_type = param.type
+            param = param.value
+
+        if sql_type is not None:
+            sql_type = sqltypes.parse_type(sql_type)
+
+        if isinstance(sql_type, sqltypes.ArrayType):
+            return self._format_typed_array(param, sql_type, path)
+
+        if isinstance(sql_type, sqltypes.MapType):
+            return self._format_typed_map(param, sql_type, path)
+
+        if isinstance(sql_type, sqltypes.RowType):
+            return self._format_typed_row(param, sql_type, path)
+
+        if isinstance(sql_type, sqltypes.DecimalType):
+            return self._format_typed_decimal(param, sql_type, path)
+
+        if sql_type is not None:
+            # A primitive declaration validates the value and, at the top
+            # level, wraps the regular literal in a CAST so the parameter has
+            # the declared type, for example a JSON, CHAR or integer type.
+            self._validate_typed_value(param, sql_type, path)
+            if param is None and cast_scalar:
+                # An untyped NULL has the unknown type, which would contradict
+                # the declaration.
+                return f"CAST(NULL AS {sql_type.to_sql()})"
+            literal = self._format_prepared_param(param, path=path)
+            if cast_scalar and param is not None:
+                return f"CAST({literal} AS {sql_type.to_sql()})"
+            return literal
+
         if param is None:
             return "NULL"
 
@@ -605,17 +686,31 @@ class Cursor:
             return "DATE '%s'" % date_str
 
         if isinstance(param, list):
-            return "ARRAY[%s]" % ','.join(map(self._format_prepared_param, param))
+            if not param:
+                raise self._missing_type_error(path, "an empty array")
+            return "ARRAY[%s]" % ','.join(
+                self._format_prepared_param(item, path=f"{path}[{index}]")
+                for index, item in enumerate(param)
+            )
 
         if isinstance(param, tuple):
-            return "ROW(%s)" % ','.join(map(self._format_prepared_param, param))
+            if not param:
+                raise self._missing_type_error(path, "an empty row", "row(a bigint)")
+            if all(item is None for item in param):
+                raise self._missing_type_error(path, "a row whose fields are all NULL", "row(a bigint)")
+            return "ROW(%s)" % ','.join(
+                self._format_prepared_param(item, path=f"{path}[{index}]")
+                for index, item in enumerate(param)
+            )
 
-        if isinstance(param, dict):
+        if isinstance(param, Mapping):
+            if not param:
+                raise self._missing_type_error(path, "an empty map", "map(varchar, bigint)")
             keys = list(param.keys())
             values = [param[key] for key in keys]
             return "MAP({}, {})".format(
-                self._format_prepared_param(keys),
-                self._format_prepared_param(values)
+                self._format_prepared_param(keys, path=f"{path}.keys"),
+                self._format_prepared_param(values, path=f"{path}.values")
             )
 
         if isinstance(param, uuid.UUID):
@@ -624,7 +719,251 @@ class Cursor:
         if isinstance(param, Decimal):
             return "DECIMAL '%s'" % format(param, "f")
 
-        raise trino.exceptions.NotSupportedError("Query parameter of type '%s' is not supported." % type(param))
+        raise trino.exceptions.NotSupportedError(
+            f"{path}: query parameter of type '{type(param).__name__}' is not supported."
+        )
+
+    # -- typed container encoding -------------------------------------------
+
+    @staticmethod
+    def _missing_type_error(path: str, description: str, example: str = "array(bigint)"):
+        return trino.exceptions.TrinoParameterError(
+            f"{path}: cannot infer the Trino type of {description}. "
+            f'Declare it with the typed argument, for example typed=["{example}"].'
+        )
+
+    def _format_typed_decimal(self, param, sql_type, path):
+        if param is None:
+            return f"CAST(NULL AS {sql_type.to_sql()})"
+        if isinstance(param, bool) or not isinstance(param, (Decimal, int, float)):
+            raise trino.exceptions.TrinoParameterError(
+                f"{path}: expected a decimal value for {sql_type.to_sql()}, "
+                f"got {type(param).__name__}"
+            )
+        if isinstance(param, float):
+            if math.isnan(param) or math.isinf(param):
+                raise trino.exceptions.TrinoParameterError(
+                    f"{path}: {param!r} cannot be represented as {sql_type.to_sql()}"
+                )
+            value = Decimal(str(param))
+        elif isinstance(param, int):
+            value = Decimal(param)
+        else:
+            value = param
+
+        if not value.is_finite():
+            raise trino.exceptions.TrinoParameterError(
+                f"{path}: {param!r} cannot be represented as {sql_type.to_sql()}"
+            )
+
+        # Round half up the same way a CAST to DECIMAL does and make sure the
+        # result fits into the declared precision. A local context is needed
+        # because the default context only has 28 digits of precision.
+        with localcontext() as context:
+            context.prec = max(len(value.as_tuple().digits), sql_type.precision) + 2
+            scaled = value.scaleb(sql_type.scale)
+            rounded = scaled.to_integral_value(rounding=ROUND_HALF_UP)
+        if rounded != 0 and rounded.adjusted() + 1 > sql_type.precision:
+            raise trino.exceptions.TrinoParameterError(
+                f"{path}: value {param!r} does not fit in {sql_type.to_sql()}"
+            )
+        return f"CAST(DECIMAL '{format(value, 'f')}' AS {sql_type.to_sql()})"
+
+    def _validate_typed_value(self, param, sql_type, path):
+        """Validate a value against a primitive type declaration."""
+        name = sql_type.name.strip().lower()
+        base = name.split("(", 1)[0].strip()
+        if param is None:
+            return
+        if base in ("boolean", "bool"):
+            allowed = isinstance(param, bool)
+        elif base in ("tinyint", "smallint", "int", "integer", "bigint"):
+            allowed = isinstance(param, int) and not isinstance(param, bool)
+            if allowed:
+                allowed = self._integer_fits(param, base, path)
+        elif base in ("real", "double"):
+            allowed = isinstance(param, (int, float)) and not isinstance(param, bool)
+        elif base in ("decimal", "numeric"):
+            allowed = isinstance(param, (int, float, Decimal)) and not isinstance(param, bool)
+        elif base in ("varchar", "char", "json", "uuid", "ipaddress"):
+            allowed = isinstance(param, str) or (
+                base == "uuid" and isinstance(param, uuid.UUID)
+            )
+        elif base == "varbinary":
+            allowed = isinstance(param, (bytes, bytearray, memoryview))
+        elif base in ("date",):
+            allowed = isinstance(param, datetime.date) and not isinstance(param, datetime.datetime)
+        elif base in ("time", "time with time zone"):
+            allowed = isinstance(param, datetime.time)
+        elif base in ("timestamp", "timestamp with time zone"):
+            allowed = isinstance(param, datetime.datetime)
+        elif base == "interval day to second":
+            allowed = isinstance(param, datetime.timedelta)
+        else:
+            # Unknown primitive declarations are validated by Trino itself.
+            return
+        if not allowed:
+            raise trino.exceptions.TrinoParameterError(
+                f"{path}: expected a value compatible with {sql_type.to_sql()}, "
+                f"got {type(param).__name__}"
+            )
+        return True
+
+    @staticmethod
+    def _integer_fits(value: int, base: str, path: str) -> bool:
+        limits = {
+            "tinyint": (-2 ** 7, 2 ** 7 - 1),
+            "smallint": (-2 ** 15, 2 ** 15 - 1),
+            "int": (-2 ** 31, 2 ** 31 - 1),
+            "integer": (-2 ** 31, 2 ** 31 - 1),
+            "bigint": (-2 ** 63, 2 ** 63 - 1),
+        }
+        if base not in limits:
+            return True
+        low, high = limits[base]
+        if not low <= value <= high:
+            raise trino.exceptions.TrinoParameterError(
+                f"{path}: value {value!r} is out of range for {base.upper()} "
+                f"[{low}, {high}]"
+            )
+        return True
+
+    def _format_typed_array(self, param, sql_type, path):
+        if param is None:
+            return f"CAST(NULL AS {sql_type.to_sql()})"
+        if not isinstance(param, (list, tuple)):
+            raise trino.exceptions.TrinoParameterError(
+                f"{path}: expected a list for {sql_type.to_sql()}, got {type(param).__name__}"
+            )
+        item_type = sql_type.item_type
+        elements = [
+            self._format_prepared_param(item, path=f"{path}[{index}]", sql_type=item_type, cast_scalar=False)
+            for index, item in enumerate(param)
+        ]
+        sql = "ARRAY[%s]" % ",".join(elements)
+        return f"CAST({sql} AS {sql_type.to_sql()})"
+
+    def _format_typed_map(self, param, sql_type, path):
+        if param is None:
+            return f"CAST(NULL AS {sql_type.to_sql()})"
+        if not isinstance(param, Mapping):
+            raise trino.exceptions.TrinoParameterError(
+                f"{path}: expected a mapping for {sql_type.to_sql()}, got {type(param).__name__}"
+            )
+        keys = []
+        values = []
+        seen = {}
+        for index, key in enumerate(param.keys()):
+            key_path = f"{path}.keys[{index}]"
+            if key is None:
+                raise trino.exceptions.TrinoParameterError(
+                    f"{key_path}: a map key cannot be NULL in {sql_type.to_sql()}"
+                )
+            key_sql = self._format_prepared_param(
+                key, path=key_path, sql_type=sql_type.key_type, cast_scalar=False
+            )
+            key_identity = self._map_key_identity(key, sql_type.key_type, key_sql)
+            if key_identity in seen:
+                raise trino.exceptions.TrinoParameterError(
+                    f"{key_path}: duplicate map key {key!r} conflicts with {seen[key_identity]!r}"
+                )
+            seen[key_identity] = key
+            keys.append(key_sql)
+            values.append(self._format_prepared_param(
+                param[key], path=f"{path}[{key!r}]", sql_type=sql_type.value_type, cast_scalar=False
+            ))
+        # Cast the key and value arrays instead of the map itself: array
+        # casts are supported for every element type, while a cast between two
+        # map types is not universally available.  The resulting map already
+        # has the declared type.
+        return "MAP(CAST(ARRAY[%s] AS ARRAY(%s)), CAST(ARRAY[%s] AS ARRAY(%s)))" % (
+            ",".join(keys),
+            sql_type.key_type.to_sql(),
+            ",".join(values),
+            sql_type.value_type.to_sql(),
+        )
+
+    @staticmethod
+    def _map_key_identity(value, sql_type, formatted_sql):
+        """Normalize a map key so that keys Trino considers equal collide.
+
+        Map keys may be any Trino type, including nested containers.  For
+        primitive keys the Python value is coerced to the declared type so
+        that, for example, ``1`` and ``Decimal('1.0')`` are seen as the same
+        ``DECIMAL`` key.  Nested containers fall back to their SQL text.
+        """
+        if isinstance(sql_type, (sqltypes.ArrayType, sqltypes.MapType, sqltypes.RowType)):
+            return "sql", formatted_sql
+        base = sql_type.name.strip().lower().split("(", 1)[0].strip() if isinstance(
+            sql_type, sqltypes.ScalarType
+        ) else "decimal"
+        try:
+            if base in ("tinyint", "smallint", "int", "integer", "bigint"):
+                return "int", int(value)
+            if base in ("real", "double"):
+                if isinstance(value, float) and math.isnan(value):
+                    return "float", "nan"
+                return "float", float(value)
+            if base in ("decimal", "numeric"):
+                # A DecimalType declaration also normalizes to a decimal key.
+                return "decimal", Decimal(str(value)).normalize()
+            if base in ("boolean", "bool"):
+                return "bool", bool(value)
+            if base == "varbinary":
+                return "bytes", bytes(value)
+            if base in ("varchar", "char", "json", "uuid", "ipaddress"):
+                return "str", str(value)
+        except (TypeError, ValueError, ArithmeticError):
+            pass
+        return "sql", formatted_sql
+
+    def _format_typed_row(self, param, sql_type, path):
+        if param is None:
+            return f"CAST(NULL AS {sql_type.to_sql()})"
+        if isinstance(param, Mapping):
+            field_names = [name for name, _ in sql_type.fields]
+            if any(name is None for name in field_names):
+                raise trino.exceptions.TrinoParameterError(
+                    f"{path}: {sql_type.to_sql()} declares positional ROW fields and cannot "
+                    "be populated from a mapping"
+                )
+            missing = [name for name in field_names if name not in param]
+            if missing:
+                raise trino.exceptions.TrinoParameterError(
+                    f"{path}: missing ROW field(s) {missing} for {sql_type.to_sql()}"
+                )
+            unexpected = sorted(
+                (str(name) for name in param if name not in field_names)
+            )
+            if unexpected:
+                raise trino.exceptions.TrinoParameterError(
+                    f"{path}: unexpected ROW field(s) {unexpected} for {sql_type.to_sql()}"
+                )
+            values = [
+                self._format_prepared_param(
+                    param[name], path=f"{path}.{name}", sql_type=field_type, cast_scalar=False
+                )
+                for name, field_type in sql_type.fields
+            ]
+        elif isinstance(param, (list, tuple)):
+            if len(param) != len(sql_type.fields):
+                raise trino.exceptions.TrinoParameterError(
+                    f"{path}: ROW value has {len(param)} field(s) but "
+                    f"{sql_type.to_sql()} declares {len(sql_type.fields)}"
+                )
+            values = [
+                self._format_prepared_param(
+                    item, path=f"{path}[{index}]", sql_type=field_type, cast_scalar=False
+                )
+                for index, (item, (_, field_type)) in enumerate(zip(param, sql_type.fields))
+            ]
+        else:
+            raise trino.exceptions.TrinoParameterError(
+                f"{path}: expected a tuple or mapping for {sql_type.to_sql()}, "
+                f"got {type(param).__name__}"
+            )
+        sql = "ROW(%s)" % ",".join(values)
+        return f"CAST({sql} AS {sql_type.to_sql()})"
 
     def _deallocate_prepared_statement(self, statement_name: str) -> None:
         sql = 'DEALLOCATE PREPARE ' + statement_name
@@ -635,7 +974,40 @@ class Cursor:
     def _generate_unique_statement_name(self):
         return 'st_' + uuid.uuid4().hex.replace('-', '')
 
-    def execute(self, operation, params=None):
+    def execute(self, operation, params=None, typed=None):
+        """Execute a statement, optionally binding query parameters.
+
+        :param operation: the SQL statement.
+        :param params: a list or tuple of parameter values.
+        :param typed: optional type declarations, one per parameter.  Each
+            entry is a :class:`trino.sqltypes.SqlType` instance or a SQL type
+            string such as ``"array(bigint)"``.  Use ``None`` for parameters
+            that should be encoded by inference.  Type declarations are
+            required for empty arrays, empty maps, all-``NULL`` rows, and
+            any value whose type cannot be inferred.
+        """
+        if typed is not None:
+            if params is None:
+                raise trino.exceptions.ProgrammingError(
+                    "typed requires params: type declarations cannot be applied without parameters"
+                )
+            if not isinstance(params, (list, tuple)):
+                raise trino.exceptions.ProgrammingError(
+                    "params must be a list or tuple when typed is provided"
+                )
+            params = tuple(params)
+            typed = tuple(
+                sqltypes.parse_type(declaration) if declaration is not None else None
+                for declaration in typed
+            )
+            if len(typed) != len(params):
+                raise trino.exceptions.ProgrammingError(
+                    "typed must have exactly one entry per parameter: "
+                    f"got {len(typed)} type declarations for {len(params)} parameters"
+                )
+            if not typed:
+                typed = None
+
         if params:
             assert isinstance(params, (list, tuple)), (
                 'params must be a list or tuple containing the query '
@@ -643,6 +1015,9 @@ class Cursor:
             )
 
             if self.connection._use_legacy_prepared_statements():
+                # Encode the parameters first so that validation errors are
+                # raised before the PREPARE request is sent.
+                formatted_params = self._format_params(params, typed)
                 statement_name = self._generate_unique_statement_name()
                 self._prepare_statement(operation, statement_name)
 
@@ -650,7 +1025,7 @@ class Cursor:
                     # Send execute statement and assign the return value to `results`
                     # as it will be returned by the function
                     self._query = self._execute_prepared_statement(
-                        statement_name, params
+                        statement_name, params, typed, formatted_params=formatted_params
                     )
                     self._iterator = iter(self._query.execute())
                 finally:
@@ -660,17 +1035,22 @@ class Cursor:
                     # TODO: Consider caching prepared statements if requested by caller
                     self._deallocate_prepared_statement(statement_name)
             else:
-                self._query = self._execute_immediate_statement(operation, params)
+                self._query = self._execute_immediate_statement(operation, params, typed)
                 self._iterator = iter(self._query.execute())
 
         else:
+            if typed is not None:
+                raise trino.exceptions.ProgrammingError(
+                    "typed requires params: no type declarations can be applied to an empty "
+                    "parameter list"
+                )
             self._query = trino.client.TrinoQuery(self._request, query=operation,
                                                   legacy_primitive_types=self._legacy_primitive_types,
                                                   stats_callback=self._stats_callback)
             self._iterator = iter(self._query.execute())
         return self
 
-    def executemany(self, operation, seq_of_params):
+    def executemany(self, operation, seq_of_params, typed=None):
         """
         PEP-0249: Prepare a database operation (query or command) and then
         execute it against all parameter sequences or mappings found in the sequence seq_of_parameters.
@@ -684,15 +1064,18 @@ class Cursor:
 
         The same comments as for .execute() also apply accordingly to this method.
 
+        ``typed`` is applied to every parameter sequence, and follows the same
+        rules as for :meth:`execute`.
+
         Return values are not defined.
         """
         for parameters in seq_of_params[:-1]:
-            self.execute(operation, parameters)
+            self.execute(operation, parameters, typed=typed)
             self.fetchall()
             if self._query.update_type is None:
                 raise NotSupportedError("Query must return update type")
         if seq_of_params:
-            self.execute(operation, seq_of_params[-1])
+            self.execute(operation, seq_of_params[-1], typed=typed)
         else:
             self.execute(operation)
         return self
@@ -792,8 +1175,8 @@ class SegmentCursor(Cursor):
         if self.connection._client_session.encoding is None:
             raise ValueError("SegmentCursor can only be used if encoding is set on the connection")
 
-    def execute(self, operation, params=None):
-        if params:
+    def execute(self, operation, params=None, typed=None):
+        if params or typed is not None:
             # TODO: refactor code to allow for params to be supported
             raise ValueError("params not supported")
 

@@ -37,6 +37,7 @@ from trino.dbapi import Cursor
 from trino.dbapi import DescribeOutput
 from trino.dbapi import TimeBoundLRUCache
 from trino.exceptions import NotSupportedError
+from trino.exceptions import TrinoParameterError
 from trino.exceptions import TrinoQueryError
 from trino.exceptions import TrinoUserError
 from trino.mapper import RowMapperFactory
@@ -2151,3 +2152,188 @@ class _TestTable:
     @property
     def table_name(self):
         return self._table_name
+
+
+@pytest.mark.parametrize(
+    "legacy_prepared_statements",
+    [
+        True,
+        pytest.param(False, marks=pytest.mark.skipif(
+            trino_version() <= 417,
+            reason="EXECUTE IMMEDIATE was introduced in version 418")),
+        None
+    ]
+)
+def test_typed_empty_array_query_param(legacy_prepared_statements, run_trino):
+    cur = get_cursor(legacy_prepared_statements, run_trino)
+
+    cur.execute("SELECT ?, TYPEOF(?)", params=([], []), typed=["array(bigint)", "array(bigint)"])
+    rows = cur.fetchall()
+
+    assert rows[0][0] == []
+    assert rows[0][1] == "array(bigint)"
+
+
+@pytest.mark.parametrize(
+    "legacy_prepared_statements",
+    [
+        True,
+        pytest.param(False, marks=pytest.mark.skipif(
+            trino_version() <= 417,
+            reason="EXECUTE IMMEDIATE was introduced in version 418")),
+        None
+    ]
+)
+def test_typed_empty_map_query_param(legacy_prepared_statements, run_trino):
+    cur = get_cursor(legacy_prepared_statements, run_trino)
+
+    cur.execute("SELECT ?, TYPEOF(?)", params=({}, {}), typed=["map(varchar, bigint)"] * 2)
+    rows = cur.fetchall()
+
+    assert rows[0][0] == {}
+    assert rows[0][1] == "map(varchar, bigint)"
+
+
+@pytest.mark.parametrize(
+    "legacy_prepared_statements",
+    [
+        True,
+        pytest.param(False, marks=pytest.mark.skipif(
+            trino_version() <= 417,
+            reason="EXECUTE IMMEDIATE was introduced in version 418")),
+        None
+    ]
+)
+def test_typed_all_null_row_query_param(legacy_prepared_statements, run_trino):
+    cur = get_cursor(legacy_prepared_statements, run_trino)
+
+    cur.execute(
+        "SELECT ?, TYPEOF(?)",
+        params=((None, None), (None, None)),
+        typed=["row(x bigint, y varchar)"] * 2,
+    )
+    rows = cur.fetchall()
+
+    assert rows[0][0] == (None, None)
+    assert rows[0][1] == "row(x bigint, y varchar)"
+
+
+@pytest.mark.parametrize(
+    "legacy_prepared_statements",
+    [
+        True,
+        pytest.param(False, marks=pytest.mark.skipif(
+            trino_version() <= 417,
+            reason="EXECUTE IMMEDIATE was introduced in version 418")),
+        None
+    ]
+)
+def test_typed_nested_empty_containers_query_param(legacy_prepared_statements, run_trino):
+    cur = get_cursor(legacy_prepared_statements, run_trino)
+
+    params = ({"a": [], "b": []},)
+    typed = ["map(varchar, array(bigint))"]
+
+    cur.execute("SELECT ?", params=params, typed=typed)
+    assert cur.fetchall()[0][0] == params[0]
+
+    params = ([[]],)
+    typed = ["array(array(bigint))"]
+    cur.execute("SELECT ?", params=params, typed=typed)
+    assert cur.fetchall()[0][0] == params[0]
+
+
+@pytest.mark.parametrize(
+    "legacy_prepared_statements",
+    [
+        True,
+        pytest.param(False, marks=pytest.mark.skipif(
+            trino_version() <= 417,
+            reason="EXECUTE IMMEDIATE was introduced in version 418")),
+        None
+    ]
+)
+def test_typed_decimal_query_param(legacy_prepared_statements, run_trino):
+    cur = get_cursor(legacy_prepared_statements, run_trino)
+
+    cur.execute("SELECT ?, TYPEOF(?)", params=(Decimal("1.25"), Decimal("1.25")), typed=["decimal(4,2)"] * 2)
+    rows = cur.fetchall()
+
+    assert rows[0][0] == Decimal("1.25")
+    assert rows[0][1] == "decimal(4, 2)"
+
+
+@pytest.mark.parametrize(
+    "legacy_prepared_statements",
+    [
+        True,
+        pytest.param(False, marks=pytest.mark.skipif(
+            trino_version() <= 417,
+            reason="EXECUTE IMMEDIATE was introduced in version 418")),
+        None
+    ]
+)
+def test_typed_null_container_query_param(legacy_prepared_statements, run_trino):
+    cur = get_cursor(legacy_prepared_statements, run_trino)
+
+    cur.execute("SELECT ?, TYPEOF(?)", params=(None, None), typed=["array(bigint)"] * 2)
+    rows = cur.fetchall()
+
+    assert rows[0][0] is None
+    assert rows[0][1] == "array(bigint)"
+
+
+@pytest.mark.parametrize(
+    "legacy_prepared_statements",
+    [
+        True,
+        pytest.param(False, marks=pytest.mark.skipif(
+            trino_version() <= 417,
+            reason="EXECUTE IMMEDIATE was introduced in version 418")),
+        None
+    ]
+)
+def test_untyped_empty_containers_are_rejected_before_the_request(legacy_prepared_statements, run_trino):
+    cur = get_cursor(legacy_prepared_statements, run_trino)
+
+    with pytest.raises(TrinoParameterError) as e:
+        cur.execute("SELECT ?", params=([],))
+    assert "params[0]" in str(e.value)
+    assert "cannot infer" in str(e.value)
+
+    with pytest.raises(TrinoParameterError):
+        cur.execute("SELECT ?", params=({},))
+
+    with pytest.raises(TrinoParameterError):
+        cur.execute("SELECT ?", params=((None, None),))
+
+    assert cur.query_id is None
+
+
+@pytest.mark.parametrize(
+    "legacy_prepared_statements",
+    [
+        True,
+        pytest.param(False, marks=pytest.mark.skipif(
+            trino_version() <= 417,
+            reason="EXECUTE IMMEDIATE was introduced in version 418")),
+        None
+    ]
+)
+def test_typed_parameter_errors_report_the_full_path(legacy_prepared_statements, run_trino):
+    cur = get_cursor(legacy_prepared_statements, run_trino)
+
+    with pytest.raises(TrinoParameterError) as e:
+        cur.execute("SELECT ?", params=({"a": [1, 2 ** 40]},), typed=["map(varchar, array(integer))"])
+    assert "params[0]['a'][1]" in str(e.value)
+    assert "out of range" in str(e.value)
+
+    with pytest.raises(TrinoParameterError) as e:
+        cur.execute("SELECT ?", params=((1, 2, 3),), typed=["row(x bigint, y varchar)"])
+    assert "params[0]" in str(e.value)
+    assert "3 field(s)" in str(e.value)
+
+    with pytest.raises(TrinoParameterError) as e:
+        cur.execute("SELECT ?", params=({1: 1, 1.0: 2},), typed=["map(double, bigint)"])
+    assert "params[0].keys[1]" in str(e.value)
+    assert "duplicate map key" in str(e.value)

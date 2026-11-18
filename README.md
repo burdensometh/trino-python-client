@@ -78,6 +78,65 @@ the query's current stats dictionary (the same dictionary returned by
 `Cursor.stats`), so mutating it has no effect on the client. Any exception
 raised by the callback propagates to the caller of `execute()`/`fetch()`.
 
+**Typed query parameters**
+
+Some values do not carry enough information for Trino to infer a type. An
+empty array (`ARRAY[]`), an empty map (`MAP()`) and a row whose fields are all
+`NULL` (`ROW(NULL, NULL)`) are ambiguous, so such parameters must be typed.
+Pass a type declaration for each parameter with the `typed` argument:
+
+```python
+from trino.sqltypes import ArrayType, MapType, RowType, ScalarType, DecimalType
+
+cur.execute(
+    "INSERT INTO events (id, tags, attributes, location) VALUES (?, ?, ?, ?)",
+    params=(
+        1,
+        [],
+        {},
+        (None, None),
+    ),
+    typed=[
+        None,  # inferred as BIGINT
+        ArrayType("VARCHAR"),
+        MapType("VARCHAR", "BIGINT"),
+        RowType([("lat", "DOUBLE"), ("lon", "DOUBLE")]),
+    ],
+)
+```
+
+Declarations may also be written as Trino SQL type strings. `None` means the
+value is encoded by inference as before, so ordinary parameters continue to
+work unchanged:
+
+```python
+cur.execute(
+    "SELECT ?, ?",
+    params=([], Decimal("1.25")),
+    typed=["array(bigint)", "decimal(4, 2)"],
+)
+```
+
+The `typed` argument has exactly one entry per parameter, or can be given for a
+single parameter with `Typed`:
+
+```python
+from trino.sqltypes import Typed
+
+cur.execute("SELECT ?", params=(Typed({}, "map(varchar, bigint)"),))
+```
+
+Declarations are checked before a request is sent. Numeric overflow, a ROW
+value whose field count or field names do not match, and duplicate map keys
+raise `trino.exceptions.TrinoParameterError` with the full path of the offending
+value, for example `params[0]['items'][1]`.
+
+A `NULL` container and an empty container are different values and both need a
+declaration: `params=(None,)` with `typed=["array(bigint)"]` sends a typed
+`NULL`, while `params=([],)` with the same declaration sends an empty array.
+Without a declaration, an empty container raises `TrinoParameterError` instead
+of producing SQL that the coordinator rejects.
+
 ### SQLAlchemy
 
 **Prerequisite**
@@ -126,6 +185,25 @@ nodes = Table(
 )
 rows = connection.execute(select(nodes)).fetchall()
 ```
+
+Bind values are typed from the SQLAlchemy column type, so empty arrays, empty
+maps and all-`NULL` rows do not need a hand-written typed SQL literal:
+
+```python
+events = Table(
+    'events',
+    MetaData(schema='test'),
+    Column('id', Integer),
+    Column('tags', ARRAY(String)),
+    Column('attributes', MAP(String, Integer)),
+)
+
+connection.execute(events.insert(), {"id": 1, "tags": [], "attributes": {}})
+```
+
+The same rules as for the DBAPI apply: a value that does not fit its column
+type raises `trino.exceptions.TrinoParameterError` with the path of the
+offending value before the request is sent.
 
 In order to pass additional connection attributes use [connect_args](https://docs.sqlalchemy.org/en/14/core/engines.html#sqlalchemy.create_engine.params.connect_args) method.
 Attributes can also be passed in the connection string.

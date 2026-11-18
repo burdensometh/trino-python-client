@@ -9,12 +9,20 @@ import pytest
 from sqlalchemy import exc
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.engine.url import URL
+from sqlalchemy.sql.sqltypes import ARRAY
+from sqlalchemy.sql.sqltypes import CHAR
+from sqlalchemy.sql.sqltypes import DECIMAL
+from sqlalchemy.sql.sqltypes import Integer
+from sqlalchemy.sql.sqltypes import NullType
+from sqlalchemy.sql.sqltypes import String
 
 import trino.exceptions
 from trino.auth import BasicAuthentication
 from trino.auth import OAuth2Authentication
 from trino.dbapi import Connection
 from trino.sqlalchemy import URL as trino_url
+from trino.sqlalchemy.datatype import MAP
+from trino.sqlalchemy.datatype import ROW
 from trino.sqlalchemy.dialect import CertificateAuthentication
 from trino.sqlalchemy.dialect import JWTAuthentication
 from trino.sqlalchemy.dialect import TrinoDialect
@@ -652,3 +660,152 @@ def test_server_version_info_handles_orig_without_message_attribute():
     dialect._get_server_version_info(FailingConnection())
 
     assert dialect.server_version_info is None
+
+
+class _ContextStub:
+    """Minimal execution context exposing what _typed_parameters reads."""
+
+    def __init__(self, positiontup, binds, expanded=None, escaped=None):
+        self.compiled = mock.Mock()
+        self.compiled.positiontup = positiontup
+        self.compiled.binds = binds
+        self.compiled.escaped_bind_names = escaped or {}
+        self._expanded_parameters = expanded or {}
+
+
+class _BindStub:
+    def __init__(self, type_):
+        self.type = type_
+
+
+@pytest.mark.parametrize(
+    "sql_type,expected",
+    [
+        (ARRAY(String), "ARRAY(VARCHAR)"),
+        (ARRAY(Integer, dimensions=2), "ARRAY(ARRAY(INTEGER))"),
+        (MAP(String, DECIMAL(4, 2)), "MAP(VARCHAR, DECIMAL(4, 2))"),
+        (ROW([("x", Integer), ("y", ARRAY(CHAR(3)))]), 'ROW("x" INTEGER, "y" ARRAY(CHAR(3)))'),
+        (DECIMAL(6, 3), "DECIMAL(6, 3)"),
+        (Integer(), None),
+        (String(), None),
+        (DECIMAL(), None),
+        (DECIMAL(5), "DECIMAL(5, 0)"),
+        (ARRAY(NullType()), None),
+    ]
+)
+def test_parameter_declaration(sql_type, expected):
+    dialect = TrinoDialect()
+    assert dialect._parameter_declaration(sql_type) == expected
+
+
+def test_typed_parameters_aligns_expanded_binds():
+    dialect = TrinoDialect()
+    context = _ContextStub(
+        positiontup=["id_1"],
+        binds={"id_1": _BindStub(ARRAY(String))},
+        expanded={"id_1": ["id_1_1", "id_1_2"]},
+    )
+    assert dialect._typed_parameters(context) == ["ARRAY(VARCHAR)", "ARRAY(VARCHAR)"]
+
+
+def test_typed_parameters_returns_none_when_nothing_is_declared():
+    dialect = TrinoDialect()
+    context = _ContextStub(
+        positiontup=["a", "b"],
+        binds={"a": _BindStub(Integer()), "b": _BindStub(String())},
+    )
+    assert dialect._typed_parameters(context) is None
+
+
+def test_typed_parameters_returns_none_without_context():
+    assert TrinoDialect()._typed_parameters(None) is None
+
+
+def test_typed_parameters_resolves_escaped_bind_names():
+    dialect = TrinoDialect()
+    context = _ContextStub(
+        positiontup=["param_1"],
+        binds={"param_1": _BindStub(MAP(String, Integer))},
+        escaped={"param_1": "param_1"},
+    )
+    assert dialect._typed_parameters(context) == ["MAP(VARCHAR, INTEGER)"]
+
+
+def test_do_execute_passes_declarations_to_dbapi():
+    dialect = TrinoDialect()
+    cursor = mock.Mock()
+    context = _ContextStub(
+        positiontup=["value"],
+        binds={"value": _BindStub(ARRAY(String))},
+    )
+    dialect.do_execute(cursor, "SELECT ?", ([],), context)
+    cursor.execute.assert_called_once_with("SELECT ?", ([],), typed=["ARRAY(VARCHAR)"])
+
+
+def test_do_execute_without_declarations_keeps_dbapi_call_unchanged():
+    dialect = TrinoDialect()
+    cursor = mock.Mock()
+    context = _ContextStub(
+        positiontup=["value"],
+        binds={"value": _BindStub(Integer())},
+    )
+    dialect.do_execute(cursor, "SELECT ?", (1,), context)
+    cursor.execute.assert_called_once_with("SELECT ?", (1,))
+
+
+def test_do_executemany_passes_declarations_to_dbapi():
+    dialect = TrinoDialect()
+    cursor = mock.Mock()
+    context = _ContextStub(
+        positiontup=["value"],
+        binds={"value": _BindStub(MAP(String, Integer))},
+    )
+    dialect.do_executemany(cursor, "INSERT INTO t VALUES (?)", [({},)], context)
+    cursor.executemany.assert_called_once_with(
+        "INSERT INTO t VALUES (?)", [({},)], typed=["MAP(VARCHAR, INTEGER)"]
+    )
+
+
+def test_do_execute_without_context_does_not_declare_types():
+    dialect = TrinoDialect()
+    cursor = mock.Mock()
+    dialect.do_execute(cursor, "SELECT ?", ([],), None)
+    cursor.execute.assert_called_once_with("SELECT ?", ([],))
+
+
+class _RecordingDBAPICursor:
+    """DBAPI cursor stub that records the SQL the dialect produces."""
+
+    def __init__(self):
+        self.calls = []
+
+    def execute(self, statement, parameters=None, typed=None):
+        self.calls.append(("execute", statement, parameters, typed))
+
+    def executemany(self, statement, parameters, typed=None):
+        self.calls.append(("executemany", statement, parameters, typed))
+
+    def close(self):
+        pass
+
+    description = None
+    rowcount = -1
+    query_id = None
+    query = None
+    stats = None
+    warnings = None
+
+
+def test_do_execute_encodes_empty_containers_without_caller_type_sql():
+    dialect = TrinoDialect()
+    cursor = _RecordingDBAPICursor()
+    context = _ContextStub(
+        positiontup=["tags", "attributes"],
+        binds={
+            "tags": _BindStub(ARRAY(String)),
+            "attributes": _BindStub(MAP(String, Integer)),
+        },
+    )
+    dialect.do_execute(cursor, "INSERT INTO t VALUES (?, ?)", ([], {}), context)
+    _, _, _, typed = cursor.calls[0]
+    assert typed == ["ARRAY(VARCHAR)", "MAP(VARCHAR, INTEGER)"]

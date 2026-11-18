@@ -12,6 +12,7 @@
 import json
 import threading
 import uuid
+from decimal import Decimal
 from unittest.mock import patch
 
 import httpretty
@@ -29,6 +30,7 @@ from tests.unit.oauth_test_utils import RedirectHandler
 from tests.unit.oauth_test_utils import SERVER_ADDRESS
 from tests.unit.oauth_test_utils import TOKEN_RESOURCE
 from trino import constants
+from trino import sqltypes
 from trino.auth import BasicAuthentication
 from trino.auth import OAuth2Authentication
 from trino.dbapi import Binary
@@ -545,3 +547,279 @@ def test_format_prepared_param_binary(value, expected):
     assert cursor._format_prepared_param(value) == expected
     # Round trip through Binary(), as SQLAlchemy's _Binary.bind_processor does.
     assert cursor._format_prepared_param(Binary(value)) == expected
+
+
+class _StubCursorConnection:
+    """Minimal stand-in for a DBAPI connection used by Cursor.execute()."""
+
+    host = "coordinator"
+    port = 8080
+
+    def __init__(self, legacy_prepared_statements=False):
+        self.legacy_prepared_statements = legacy_prepared_statements
+
+    def _use_legacy_prepared_statements(self):
+        return self.legacy_prepared_statements
+
+    def _create_request(self):
+        return object()
+
+
+class _RecordingQuery:
+    """Replacement for trino.client.TrinoQuery that records the SQL."""
+
+    statements = []
+
+    def __init__(self, request, query, **kwargs):
+        type(self).statements.append(query)
+
+    @property
+    def update_type(self):
+        return "INSERT"
+
+    def execute(self):
+        return iter([])
+
+
+@pytest.fixture
+def recording_cursor(monkeypatch):
+    _RecordingQuery.statements = []
+    monkeypatch.setattr("trino.dbapi.trino.client.TrinoQuery", _RecordingQuery)
+
+    def build(legacy_prepared_statements=False):
+        cursor = Cursor.__new__(Cursor)
+        cursor._connection = _StubCursorConnection(legacy_prepared_statements)
+        cursor._request = object()
+        cursor._legacy_primitive_types = False
+        cursor._stats_callback = None
+        return cursor
+
+    return build
+
+
+@pytest.mark.parametrize(
+    "value,declaration,expected",
+    [
+        ([], "array(bigint)", "CAST(ARRAY[] AS ARRAY(bigint))"),
+        ([1, 2], "array(integer)", "CAST(ARRAY[1,2] AS ARRAY(integer))"),
+        ({}, "map(varchar, bigint)",
+         "MAP(CAST(ARRAY[] AS ARRAY(varchar)), CAST(ARRAY[] AS ARRAY(bigint)))"),
+        ({"a": 1}, "map(varchar, bigint)",
+         "MAP(CAST(ARRAY['a'] AS ARRAY(varchar)), CAST(ARRAY[1] AS ARRAY(bigint)))"),
+        ((None, None), "row(x bigint, y varchar)", "CAST(ROW(NULL,NULL) AS ROW(x bigint, y varchar))"),
+        ((1, "a"), "row(x bigint, y varchar)", "CAST(ROW(1,'a') AS ROW(x bigint, y varchar))"),
+        (None, "array(bigint)", "CAST(NULL AS ARRAY(bigint))"),
+        (
+            [[1], [2]],
+            "array(array(bigint))",
+            "CAST(ARRAY[CAST(ARRAY[1] AS ARRAY(bigint)),CAST(ARRAY[2] AS ARRAY(bigint))] "
+            "AS ARRAY(ARRAY(bigint)))",
+        ),
+        (
+            ([], {}),
+            "row(x array(bigint), y map(varchar, integer))",
+            "CAST(ROW(CAST(ARRAY[] AS ARRAY(bigint)),"
+            "MAP(CAST(ARRAY[] AS ARRAY(varchar)), CAST(ARRAY[] AS ARRAY(integer)))) "
+            "AS ROW(x ARRAY(bigint), y MAP(varchar, integer)))",
+        ),
+        ({"a": []}, "map(varchar, array(bigint))",
+         "MAP(CAST(ARRAY['a'] AS ARRAY(varchar)), "
+         "CAST(ARRAY[CAST(ARRAY[] AS ARRAY(bigint))] AS ARRAY(ARRAY(bigint))))"),
+    ]
+)
+def test_format_typed_container_param(value, declaration, expected):
+    cursor = Cursor.__new__(Cursor)
+    assert cursor._format_prepared_param(value, sql_type=declaration) == expected
+
+
+def test_format_typed_param_accepts_sqltype_instances():
+    cursor = Cursor.__new__(Cursor)
+    declaration = sqltypes.MapType(
+        sqltypes.ScalarType("VARCHAR"),
+        sqltypes.ArrayType(sqltypes.ScalarType("BIGINT")),
+    )
+    assert cursor._format_prepared_param({}, sql_type=declaration) == \
+        "MAP(CAST(ARRAY[] AS ARRAY(VARCHAR)), CAST(ARRAY[] AS ARRAY(ARRAY(BIGINT))))"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [[], (), {}],
+)
+def test_untyped_uninferrable_container_raises(value):
+    cursor = Cursor.__new__(Cursor)
+    with pytest.raises(trino.exceptions.TrinoParameterError) as excinfo:
+        cursor._format_prepared_param(value)
+    assert str(excinfo.value).startswith("params[0]: cannot infer")
+
+
+def test_untyped_all_null_row_raises():
+    cursor = Cursor.__new__(Cursor)
+    with pytest.raises(trino.exceptions.TrinoParameterError, match=r"params\[0\]: cannot infer"):
+        cursor._format_prepared_param((None, None))
+
+
+def test_untyped_nested_empty_container_reports_full_path():
+    cursor = Cursor.__new__(Cursor)
+    with pytest.raises(trino.exceptions.TrinoParameterError) as excinfo:
+        cursor._format_prepared_param([[1, 2], []])
+    assert str(excinfo.value).startswith("params[0][1]: cannot infer")
+
+
+def test_integer_out_of_range_reports_full_path():
+    cursor = Cursor.__new__(Cursor)
+    with pytest.raises(trino.exceptions.TrinoParameterError) as excinfo:
+        cursor._format_prepared_param([1, 2 ** 40], sql_type="array(integer)")
+    message = str(excinfo.value)
+    assert message.startswith("params[0][1]:")
+    assert "INTEGER" in message
+    assert "out of range" in message
+
+
+def test_typed_scalar_rejects_incompatible_python_type():
+    cursor = Cursor.__new__(Cursor)
+    with pytest.raises(trino.exceptions.TrinoParameterError) as excinfo:
+        cursor._format_prepared_param({"k": "value"}, sql_type="map(varchar, bigint)")
+    assert str(excinfo.value).startswith("params[0]['k']:")
+
+
+def test_decimal_precision_and_scale_are_enforced():
+    cursor = Cursor.__new__(Cursor)
+    assert cursor._format_prepared_param(Decimal("1.235"), sql_type="decimal(6,2)") == \
+        "CAST(DECIMAL '1.235' AS DECIMAL(6, 2))"
+    with pytest.raises(trino.exceptions.TrinoParameterError) as excinfo:
+        cursor._format_prepared_param(Decimal("10000.00"), sql_type="decimal(6,2)")
+    assert "does not fit in DECIMAL(6, 2)" in str(excinfo.value)
+
+
+def test_typed_nested_decimal_reports_full_path():
+    cursor = Cursor.__new__(Cursor)
+    with pytest.raises(trino.exceptions.TrinoParameterError) as excinfo:
+        cursor._format_prepared_param(
+            [Decimal("1.00"), Decimal("100.00")],
+            sql_type="array(decimal(4,2))",
+        )
+    assert str(excinfo.value).startswith("params[0][1]:")
+
+
+def test_row_field_mismatch_reports_full_path():
+    cursor = Cursor.__new__(Cursor)
+    with pytest.raises(trino.exceptions.TrinoParameterError) as excinfo:
+        cursor._format_prepared_param(
+            {"outer": (1, "a", True)},
+            sql_type="map(varchar, row(x bigint, y varchar))",
+        )
+    assert "ROW value has 3 field(s)" in str(excinfo.value)
+
+
+def test_row_mapping_field_mismatch_lists_missing_and_unexpected_fields():
+    cursor = Cursor.__new__(Cursor)
+    with pytest.raises(trino.exceptions.TrinoParameterError) as excinfo:
+        cursor._format_prepared_param({"x": 1, "z": 2}, sql_type="row(x bigint, y varchar)")
+    message = str(excinfo.value)
+    assert "missing ROW field(s) ['y']" in message
+
+
+def test_row_mapping_rejects_unexpected_fields():
+    cursor = Cursor.__new__(Cursor)
+    with pytest.raises(trino.exceptions.TrinoParameterError) as excinfo:
+        cursor._format_prepared_param({"x": 1, "y": "a", "z": 2}, sql_type="row(x bigint, y varchar)")
+    assert "unexpected ROW field(s) ['z']" in str(excinfo.value)
+
+
+def test_map_key_conflict_reports_both_keys():
+    cursor = Cursor.__new__(Cursor)
+    # NaN is not equal to itself, so Python keeps both keys in the mapping,
+    # but Trino treats them as the same DOUBLE key.
+    with pytest.raises(trino.exceptions.TrinoParameterError) as excinfo:
+        cursor._format_prepared_param({float("nan"): "a", float("nan"): "b"}, sql_type="map(double, varchar)")
+    message = str(excinfo.value)
+    assert message.startswith("params[0].keys[1]:")
+    assert "duplicate map key" in message
+
+
+def test_map_key_conflict_inside_nested_value_reports_full_path():
+    cursor = Cursor.__new__(Cursor)
+    with pytest.raises(trino.exceptions.TrinoParameterError) as excinfo:
+        cursor._format_prepared_param(
+            [("a", {float("nan"): 1, float("nan"): 2})],
+            sql_type="array(row(name varchar, values map(double, bigint)))",
+        )
+    assert str(excinfo.value).startswith("params[0][0][1].keys[1]:")
+    assert "duplicate map key" in str(excinfo.value)
+
+
+def test_typed_requires_one_declaration_per_param(recording_cursor):
+    cursor = recording_cursor()
+    with pytest.raises(trino.exceptions.ProgrammingError, match="exactly one entry per parameter"):
+        cursor.execute("SELECT ?, ?", ([], [1]), typed=["array(bigint)"])
+    with pytest.raises(trino.exceptions.ProgrammingError, match="typed requires params"):
+        cursor.execute("SELECT 1", typed=["array(bigint)"])
+    assert _RecordingQuery.statements == []
+
+
+def test_execute_immediate_applies_typed_cast(recording_cursor):
+    cursor = recording_cursor(legacy_prepared_statements=False)
+    cursor.execute("SELECT ?", ([],), typed=["array(bigint)"])
+    assert _RecordingQuery.statements[-1] == \
+        "EXECUTE IMMEDIATE 'SELECT ?' USING CAST(ARRAY[] AS ARRAY(bigint))"
+
+
+def test_execute_immediate_mixes_typed_and_untyped_params(recording_cursor):
+    cursor = recording_cursor(legacy_prepared_statements=False)
+    cursor.execute("SELECT ?, ?", (1, {}), typed=[None, "map(varchar, integer)"])
+    assert _RecordingQuery.statements[-1] == (
+        "EXECUTE IMMEDIATE 'SELECT ?, ?' USING 1,"
+        "MAP(CAST(ARRAY[] AS ARRAY(varchar)), CAST(ARRAY[] AS ARRAY(integer)))"
+    )
+
+
+def test_legacy_prepared_statements_apply_typed_cast(recording_cursor):
+    cursor = recording_cursor(legacy_prepared_statements=True)
+    cursor.execute("SELECT ?", ({},), typed=["map(varchar, integer)"])
+    statements = _RecordingQuery.statements
+    assert statements[0].startswith("PREPARE ")
+    assert "USING MAP(CAST(ARRAY[] AS ARRAY(varchar)), CAST(ARRAY[] AS ARRAY(integer)))" in statements[1]
+    assert statements[2].startswith("DEALLOCATE PREPARE ")
+
+
+def test_executemany_applies_typed_to_every_parameter_sequence(recording_cursor):
+    cursor = recording_cursor(legacy_prepared_statements=False)
+    cursor.executemany("INSERT INTO t VALUES (?)", [([],), ([1],)], typed=["array(bigint)"])
+    executed = [statement for statement in _RecordingQuery.statements if statement.startswith("EXECUTE")]
+    assert len(executed) == 2
+    assert all("CAST(ARRAY[%s] AS ARRAY(bigint))" % ("" if first else "1") in statement
+               for first, statement in zip([True, False], executed))
+
+
+def test_null_map_key_is_rejected_with_path():
+    cursor = Cursor.__new__(Cursor)
+    with pytest.raises(trino.exceptions.TrinoParameterError) as excinfo:
+        cursor._format_prepared_param({None: 1}, sql_type="map(varchar, bigint)")
+    message = str(excinfo.value)
+    assert message.startswith("params[0].keys[0]:")
+    assert "cannot be NULL" in message
+
+
+def test_primitive_declaration_wraps_value_in_cast():
+    cursor = Cursor.__new__(Cursor)
+    assert cursor._format_prepared_param(1, sql_type="integer") == "CAST(1 AS integer)"
+    assert cursor._format_prepared_param("{}", sql_type="json") == "CAST('{}' AS json)"
+    assert cursor._format_prepared_param(None, sql_type="integer") == "CAST(NULL AS integer)"
+    # Inside a declared container the container's CAST already covers the value.
+    assert cursor._format_prepared_param(None, sql_type="integer", cast_scalar=False) == "NULL"
+
+
+def test_typed_param_wrapper():
+    cursor = Cursor.__new__(Cursor)
+    assert cursor._format_prepared_param(sqltypes.Typed([], "array(bigint)")) == \
+        "CAST(ARRAY[] AS ARRAY(bigint))"
+    with pytest.raises(trino.exceptions.TrinoParameterError, match="cannot be combined"):
+        cursor._format_prepared_param(sqltypes.Typed([], "array(bigint)"), sql_type="array(integer)")
+
+
+def test_legacy_prepared_statements_do_not_prepare_when_validation_fails(recording_cursor):
+    cursor = recording_cursor(legacy_prepared_statements=True)
+    with pytest.raises(trino.exceptions.TrinoParameterError):
+        cursor.execute("SELECT ?", params=([], ), typed=None)
+    assert _RecordingQuery.statements == []
