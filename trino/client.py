@@ -111,7 +111,8 @@ __all__ = [
     "DecodableSegment",
     "SpooledSegment",
     "InlineSegment",
-    "Segment"
+    "Segment",
+    "PrefetchConfig",
 ]
 
 logger = trino.logging.get_logger(__name__)
@@ -141,6 +142,40 @@ if _ZSTD_ERROR:
     CODECS_UNAVAILABLE["zstd"] = _ZSTD_ERROR
 
 ROLE_PATTERN = re.compile(r"^ROLE\{(.*)\}$")
+
+
+@dataclass(frozen=True)
+class PrefetchConfig:
+    """
+    Configuration of the optional spooled-segment prefetch pipeline.
+
+    When enabled, spooled segments following the one currently consumed are
+    downloaded and decoded ahead of time by a bounded pool of worker threads.
+    Rows are still delivered in the server-side order: a segment that finishes
+    early is buffered until every preceding segment was consumed.
+
+    :param enabled: turn the prefetch pipeline on. ``False`` (the default) keeps
+                    the strictly sequential download behavior.
+    :param max_concurrency: maximum number of segments downloaded/decoded at the
+                            same time.
+    :param max_bytes: total byte budget retained by the pipeline, counting both
+                      the downloaded (possibly compressed) payloads and the
+                      decompressed/decoded payloads held in memory. A single
+                      segment larger than the budget is still allowed through;
+                      it blocks the pipeline until it can be consumed.
+    """
+
+    enabled: bool = constants.DEFAULT_SEGMENT_PREFETCH_ENABLED
+    max_concurrency: int = constants.DEFAULT_SEGMENT_PREFETCH_CONCURRENCY
+    max_bytes: int = constants.DEFAULT_SEGMENT_PREFETCH_BYTE_BUDGET
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("prefetch.enabled must be a boolean")
+        if self.max_concurrency < 1:
+            raise ValueError("prefetch.max_concurrency must be >= 1")
+        if self.max_bytes < 1:
+            raise ValueError("prefetch.max_bytes must be >= 1")
 
 
 class ClientSession:
@@ -196,6 +231,7 @@ class ClientSession:
         timezone: Optional[str] = None,
         encoding: Optional[Union[str, List[str]]] = None,
         heartbeat_interval: Optional[float] = constants.DEFAULT_HEARTBEAT_INTERVAL,
+        prefetch: Optional[PrefetchConfig] = None,
     ):
         self._object_lock = threading.Lock()
         self._prepared_statements: Dict[str, str] = {}
@@ -219,6 +255,7 @@ class ClientSession:
             self._timezone = get_localzone_name()
         self._encoding = encoding
         self._heartbeat_interval = heartbeat_interval
+        self._prefetch = copy.deepcopy(prefetch)
 
     @property
     def user(self) -> str:
@@ -322,6 +359,11 @@ class ClientSession:
     @property
     def heartbeat_interval(self) -> Optional[float]:
         return self._heartbeat_interval
+
+    @property
+    def prefetch(self) -> Optional[PrefetchConfig]:
+        with self._object_lock:
+            return copy.deepcopy(self._prefetch)
 
     @staticmethod
     def _format_roles(roles: Union[Dict[str, str], str]) -> Dict[str, str]:
@@ -931,6 +973,9 @@ class TrinoQuery:
         self._row_mapper: Optional[RowMapper] = None
         self._fetch_mode = fetch_mode
         self._stats_callback = stats_callback
+        # Active segment iterators created by this query. Iterators remove
+        # themselves when drained or closed.
+        self._segment_iterators: set[SegmentIterator] = set()
 
     @property
     def query_id(self) -> Optional[str]:
@@ -1093,12 +1138,16 @@ class TrinoQuery:
             if self._fetch_mode == "segments":
                 return spooled
             # Return iterator directly, do NOT materialize with list()
-            return SegmentIterator(
+            iterator = SegmentIterator(
                 spooled,
                 self._row_mapper,
                 request=self._request,
                 heartbeat_interval=self._request._client_session.heartbeat_interval,
+                prefetch=self._request._client_session.prefetch,
+                on_close=self._segment_iterators.discard,
             )
+            self._segment_iterators.add(iterator)
+            return iterator
         elif isinstance(status.rows, list):
             return self._row_mapper.map(rows)
         else:
@@ -1128,6 +1177,12 @@ class TrinoQuery:
 
     def cancel(self) -> None:
         """Cancel the current query"""
+        # Stop any prefetch pipeline first: in-flight segment downloads are
+        # reclaimed and no further segment is fetched before the query itself
+        # is cancelled on the coordinator.
+        for iterator in list(self._segment_iterators):
+            iterator.close()
+
         if self._next_uri is None:
             return
 
@@ -1444,6 +1499,8 @@ class SegmentIterator:
         *,
         request: Optional[TrinoRequest] = None,
         heartbeat_interval: Optional[float] = None,
+        prefetch: Optional[PrefetchConfig] = None,
+        on_close: Optional[Callable[["SegmentIterator"], None]] = None,
     ) -> None:
         self._segments = iter(segments if isinstance(segments, List) else [segments])
         self._mapper = mapper
@@ -1457,6 +1514,14 @@ class SegmentIterator:
             raise ValueError("request and heartbeat_interval must be both provided or both omitted")
         self._request = request
         self._heartbeat_interval = heartbeat_interval
+        self._prefetch_config = prefetch
+        self._prefetcher: Optional[_SegmentPrefetcher] = None
+        # Slot handed out by the prefetcher whose rows are currently consumed.
+        self._current_slot: Optional[_SegmentSlot] = None
+        # Slot whose processing failed and must be retried before moving on.
+        self._retry_slot: Optional[_SegmentSlot] = None
+        self._closed = False
+        self._on_close = on_close
 
     def __iter__(self) -> Iterator[List[Any]]:
         return self
@@ -1469,7 +1534,92 @@ class SegmentIterator:
             except StopIteration:
                 if self._finished:
                     raise StopIteration
-                self._load_next_segment()
+                if self._prefetch_enabled():
+                    self._load_next_prefetched_segment()
+                else:
+                    self._load_next_segment()
+
+    def _prefetch_enabled(self) -> bool:
+        return self._prefetch_config is not None and self._prefetch_config.enabled
+
+    def close(self) -> None:
+        """
+        Release the prefetch pipeline. Pending and in-flight downloads are
+        stopped/reclaimed, buffered segments are dropped without being
+        acknowledged, and heartbeats are terminated.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self._finished = True
+        if self._prefetcher is not None:
+            self._prefetcher.close()
+            self._prefetcher = None
+        if self._on_close is not None:
+            self._on_close(self)
+            self._on_close = None
+
+    def _load_next_prefetched_segment(self) -> None:
+        # A segment is acknowledged only after its rows were decoded and
+        # fully consumed. The pipeline never acknowledges out of order because
+        # slots are taken strictly in server-side order.
+        if self._current_slot is not None:
+            self._acknowledge_slot(self._current_slot)
+            self._current_slot = None
+
+        if self._prefetcher is None:
+            self._prefetcher = _SegmentPrefetcher(
+                self._segments,
+                self._mapper,
+                cast(PrefetchConfig, self._prefetch_config),
+                request=self._request,
+                heartbeat_interval=self._heartbeat_interval,
+            )
+
+        try:
+            if self._retry_slot is not None:
+                slot = self._retry_slot
+                # Runs the retry on this thread. A repeated failure re-arms the
+                # slot for another retry and raises the captured error.
+                try:
+                    self._prefetcher.retry(slot)
+                except BaseException:
+                    # retry() leaves the slot back in PENDING_RETRY; keep it so
+                    # the next next() retries the same segment again.
+                    self._retry_slot = slot
+                    raise
+                else:
+                    self._retry_slot = None
+            else:
+                slot = self._prefetcher.take()
+        except StopIteration:
+            self.close()
+            return
+
+        if slot is None:
+            self.close()
+            return
+
+        if slot.state == _SlotState.PENDING_RETRY:
+            # Keep the failed head segment: a retried next() re-downloads just
+            # this segment while later, already downloaded segments stay buffered.
+            self._retry_slot = slot
+            assert slot.error is not None
+            raise slot.error
+
+        assert slot.rows is not None
+        self._rows = slot.rows
+        self._current_segment = slot.segment
+        self._current_slot = slot
+
+    @staticmethod
+    def _acknowledge_slot(slot: _SegmentSlot) -> None:
+        if slot.acknowledged:
+            return
+        slot.acknowledged = True
+        segment = slot.segment.segment
+        if isinstance(segment, SpooledSegment):
+            segment.acknowledge()
 
     def _load_next_segment(self):
         # A segment is acknowledged only after its rows were decoded successfully. If the previous attempt failed
@@ -1599,3 +1749,349 @@ class Lz4QueryDataDecoder(CompressedQueryDataDecoder):
         expected_uncompressed_size = metadata["uncompressedSize"]
         decoded_bytes = lz4.block.decompress(data, uncompressed_size=int(expected_uncompressed_size))
         return decoded_bytes
+
+
+class _SlotState(Enum):
+    """Lifecycle state of a prefetch slot."""
+    RUNNING = "running"
+    # A failed head slot handed to the consumer. Background workers must not
+    # touch it; only the consumer's retry() re-downloads that segment.
+    PENDING_RETRY = "pending_retry"
+    DONE = "done"
+    CANCELLED = "cancelled"
+
+
+class _SegmentSlot:
+    """
+    A single position in the prefetch pipeline. Slots are ordered by the
+    server-side segment order, so the consumer always advances slot by slot
+    regardless of the order in which worker threads finish.
+    """
+
+    def __init__(self, segment: DecodableSegment) -> None:
+        self.segment = segment
+        self.state = _SlotState.RUNNING
+        # Decoded rows, populated once the worker finished successfully.
+        self.rows: Optional[Iterator[List[List[Any]]]] = None
+        # Error captured from the failed worker; surfaced to the consumer in order.
+        self.error: Optional[BaseException] = None
+        # Budget currently charged against the pipeline for this slot.
+        self.reserved_bytes = 0
+        # Actual measured sizes, used to reconcile the reservation on completion.
+        self.downloaded_bytes = 0
+        self.decoded_bytes = 0
+        # A retried slot is handed to the consumer more than once; make sure the
+        # underlying segment is acknowledged a single time after consumption.
+        self.acknowledged = False
+
+
+class _ByteCountingJsonDecoder(QueryDataDecoder):
+    """Wraps the leaf JSON decoder and records the number of decoded bytes."""
+
+    def __init__(self, delegate: JsonQueryDataDecoder) -> None:
+        self._delegate = delegate
+        self.decoded_bytes = 0
+
+    def decode(self, data: bytes, metadata: Dict[str, Any]) -> List[List[Any]]:
+        self.decoded_bytes = len(data)
+        return self._delegate.decode(data, metadata)
+
+
+class _SegmentPrefetcher:
+    """
+    Bounded prefetch pipeline for spooled segments.
+
+    Worker threads download and decode segments ahead of the consumer, but the
+    results can only be taken in server-side order (slot 0, slot 1, ...). Two
+    limits apply before another segment is scheduled:
+
+    * the number of in-flight (pending/running) slots is at most
+      ``max_concurrency``;
+    * the bytes reserved for in-flight and buffered segments stay within
+      ``max_bytes``. A single segment larger than the budget is still admitted
+      when nothing else is in flight, so an oversized segment never deadlocks
+      the pipeline.
+
+    A failed segment only fails its own slot; sibling segments keep downloading
+    within the concurrency/byte limits and finish buffered behind it. The failed
+    slot remains the head of the delivery order, so the consumer observes the
+    failure when it reaches that slot and retrying ``next()`` re-downloads just
+    that segment while the successful later slots wait in order.
+    """
+
+    def __init__(
+        self,
+        segments: Iterator[DecodableSegment],
+        mapper: RowMapper,
+        config: PrefetchConfig,
+        *,
+        request: Optional[TrinoRequest] = None,
+        heartbeat_interval: Optional[float] = None,
+    ) -> None:
+        self._segments = segments
+        self._mapper = mapper
+        self._config = config
+        self._request = request
+        self._heartbeat_interval = heartbeat_interval
+
+        self._condition = threading.Condition()
+        # Slots not yet consumed, in server-side order. Consumed slots are
+        # removed from the front so the list stays bounded.
+        self._slots: List[_SegmentSlot] = []
+        self._source_exhausted = False
+        self._closed = False
+        # Bytes currently charged: reservations of in-flight slots and actual
+        # downloaded/decoded sizes of buffered done slots.
+        self._used_bytes = 0
+        self._in_flight = 0
+        self._workers: List[threading.Thread] = []
+
+        # Heartbeats run for the whole lifetime of the pipeline so the
+        # coordinator does not abandon the query while any segment downloads.
+        self._heartbeat: Optional[_RequestHeartbeat] = None
+        if request is not None and heartbeat_interval:
+            self._heartbeat = _RequestHeartbeat(request, heartbeat_interval)
+            self._heartbeat.__enter__()
+
+        # Daemon worker threads: they never keep the interpreter alive and are
+        # joined by close() once their in-flight download reaches an end.
+        for index in range(config.max_concurrency):
+            worker = threading.Thread(
+                target=self._schedule,
+                name=f"trino-segment-prefetch-{index}",
+                daemon=True,
+            )
+            self._workers.append(worker)
+            worker.start()
+
+    @staticmethod
+    def _segment_size_estimate(segment: DecodableSegment) -> Tuple[int, int]:
+        """Return (downloaded, decoded) byte estimates from segment metadata."""
+        metadata = segment.metadata
+        try:
+            downloaded = int(metadata["segmentSize"]) if metadata else 0
+        except (KeyError, TypeError, ValueError):
+            downloaded = 0
+        try:
+            decoded = int(metadata["uncompressedSize"]) if metadata else 0
+        except (KeyError, TypeError, ValueError):
+            decoded = downloaded
+        return max(downloaded, 0), max(decoded, 0)
+
+    def _schedule(self) -> None:
+        """Scheduler loop: each worker thread keeps pulling the next segment."""
+        while True:
+            slot: Optional[_SegmentSlot] = None
+            with self._condition:
+                while True:
+                    if self._closed:
+                        return
+                    if self._source_exhausted:
+                        return
+                    if self._in_flight >= self._config.max_concurrency:
+                        self._condition.wait()
+                        continue
+                    try:
+                        segment = next(self._segments)
+                    except StopIteration:
+                        self._source_exhausted = True
+                        self._condition.notify_all()
+                        return
+                    downloaded, decoded = self._segment_size_estimate(segment)
+                    estimated = downloaded + decoded
+                    over_budget = self._used_bytes + estimated > self._config.max_bytes
+                    if over_budget:
+                        # A single oversized segment is admitted when nothing
+                        # else is in flight to avoid a deadlock; it then
+                        # naturally back-pressures every later segment.
+                        if self._in_flight != 0 or self._slots:
+                            # Put the segment back; the iterator is only advanced
+                            # by scheduler threads holding this condition.
+                            self._segments = itertools.chain([segment], self._segments)
+                            self._condition.wait()
+                            continue
+                        logger.warning(
+                            "Spooled segment is larger than the prefetch byte budget "
+                            "(%s > %s bytes); downloading it blocks further prefetching",
+                            estimated,
+                            self._config.max_bytes,
+                        )
+                    slot = _SegmentSlot(segment)
+                    self._slots.append(slot)
+                    slot.state = _SlotState.RUNNING
+                    slot.reserved_bytes = estimated
+                    self._used_bytes += estimated
+                    self._in_flight += 1
+                    break
+            self._run_slot(slot)
+
+    def _signal_locked(self) -> None:
+        """Wake every waiter; scheduler threads either find more work or exit."""
+        self._condition.notify_all()
+
+    def _run_slot(self, slot: _SegmentSlot) -> None:
+        try:
+            rows, downloaded, decoded = self._download_and_decode(slot.segment)
+            with self._condition:
+                slot.downloaded_bytes = downloaded
+                slot.decoded_bytes = decoded
+                slot.rows = rows
+                slot.state = _SlotState.DONE
+                self._reconcile_locked(slot)
+                self._in_flight -= 1
+                self._signal_locked()
+        except BaseException as err:  # surfaced to the consumer, never lost
+            with self._condition:
+                if self._closed:
+                    slot.state = _SlotState.CANCELLED
+                    self._reconcile_locked(slot)
+                    self._in_flight -= 1
+                    self._signal_locked()
+                    return
+                slot.error = err
+                # Hand the failed slot directly to the consumer. No background
+                # worker may re-download it: only the consumer's retry() does.
+                slot.state = _SlotState.PENDING_RETRY
+                self._reconcile_locked(slot)
+                self._in_flight -= 1
+                self._signal_locked()
+
+    def _reconcile_locked(self, slot: _SegmentSlot) -> None:
+        """Replace the upfront reservation with the measured byte usage."""
+        self._used_bytes -= slot.reserved_bytes
+        slot.reserved_bytes = 0
+        if slot.state == _SlotState.DONE:
+            # The decoded payload stays buffered until the slot is consumed;
+            # the downloaded payload is released as soon as decoding finished.
+            actual = slot.decoded_bytes
+            slot.reserved_bytes = actual
+            self._used_bytes += actual
+
+    def _download_and_decode(
+        self, decodable: DecodableSegment
+    ) -> Tuple[Iterator[List[List[Any]]], int, int]:
+        # Fetch the payload directly so its size can be measured without
+        # wrapping the segment (a wrapper would break the decoder's
+        # isinstance-based dispatch and the ack handling of the real segment).
+        segment = decodable.segment
+        data = segment.data
+        downloaded_bytes = len(data)
+        leaf = JsonQueryDataDecoder(self._mapper)
+        counting_leaf = _ByteCountingJsonDecoder(leaf)
+        if decodable.encoding == "json+zstd":
+            if "zstd" in CODECS_UNAVAILABLE:
+                raise ValueError(
+                    "zstd is not installed so json+zstd encoding is not supported: "
+                    f"{CODECS_UNAVAILABLE['zstd']}"
+                )
+            decoder: QueryDataDecoder = ZStdQueryDataDecoder(counting_leaf)
+        elif decodable.encoding == "json+lz4":
+            if "lz4" in CODECS_UNAVAILABLE:
+                raise ValueError(
+                    "lz4 is not installed so json+lz4 encoding is not supported: "
+                    f"{CODECS_UNAVAILABLE['lz4']}"
+                )
+            decoder = Lz4QueryDataDecoder(counting_leaf)
+        elif decodable.encoding == "json":
+            decoder = counting_leaf
+        else:
+            raise ValueError(f"Unsupported encoding: {decodable.encoding}")
+        rows = decoder.decode(data, segment.metadata)
+        return iter(rows), downloaded_bytes, counting_leaf.decoded_bytes
+
+    def take(self) -> Optional[_SegmentSlot]:
+        """
+        Return the next slot in server-side order, blocking until it reaches a
+        terminal state. Returns ``None`` when every slot has been consumed.
+        A failed slot is returned in the ``PENDING_RETRY`` state (with its
+        ``error`` set) instead of raising: the caller retries it via
+        :meth:`retry` or releases the pipeline via :meth:`close`. Later
+        finished slots stay buffered until the failed head slot is resolved.
+        """
+        with self._condition:
+            while True:
+                if self._closed:
+                    raise StopIteration
+                if not self._slots:
+                    if self._source_exhausted and self._in_flight == 0:
+                        # Every segment was consumed: tear the pipeline down so
+                        # scheduler threads and heartbeats do not outlive it.
+                        self._teardown_locked()
+                        return None
+                    self._condition.wait()
+                    continue
+                slot = self._slots[0]
+                if slot.state == _SlotState.RUNNING:
+                    self._condition.wait()
+                    continue
+                if slot.state == _SlotState.CANCELLED:
+                    raise StopIteration
+                if slot.state == _SlotState.DONE:
+                    # The decoded rows are handed over, so the payload is no
+                    # longer charged against the pipeline budget. Consumed
+                    # slots are dropped to keep the slot list bounded.
+                    self._used_bytes -= slot.reserved_bytes
+                    slot.reserved_bytes = 0
+                    self._slots.pop(0)
+                    self._condition.notify_all()
+                    return slot
+                # PENDING_RETRY: the failed head slot is owned by the consumer.
+                assert slot.state == _SlotState.PENDING_RETRY
+                return slot
+
+    def retry(self, slot: _SegmentSlot) -> None:
+        """
+        Re-download and decode a slot whose previous attempt failed. Runs on the
+        calling thread, blocking until the retry finishes. On success the slot is
+        back in ``DONE`` state; on another failure it returns to
+        ``PENDING_RETRY`` and the captured error is re-raised.
+        """
+        assert slot.state == _SlotState.PENDING_RETRY
+        assert self._slots and self._slots[0] is slot
+        error = slot.error
+        slot.error = None
+        with self._condition:
+            if self._closed:
+                raise StopIteration
+            downloaded, decoded = self._segment_size_estimate(slot.segment)
+            estimated = downloaded + decoded
+            slot.reserved_bytes = estimated
+            self._used_bytes += estimated
+            slot.state = _SlotState.RUNNING
+            self._in_flight += 1
+            self._condition.notify_all()
+        self._run_slot(slot)
+        if slot.state == _SlotState.PENDING_RETRY:
+            raise slot.error if slot.error is not None else error
+
+    def close(self) -> None:
+        """Stop scheduling, cancel pending work and release all buffered data."""
+        with self._condition:
+            if self._closed:
+                return
+            self._closed = True
+            for slot in self._slots:
+                if slot.state in (_SlotState.RUNNING, _SlotState.PENDING_RETRY):
+                    slot.state = _SlotState.CANCELLED
+            self._used_bytes = 0
+            self._condition.notify_all()
+        # No new segment download starts after the closed flag is set. Join the
+        # workers so each in-flight download finishes (or fails) before the HTTP
+        # session is potentially reused; the threads are daemons, so an
+        # unresponsive download cannot block interpreter shutdown.
+        for worker in self._workers:
+            if worker is not threading.current_thread():
+                worker.join()
+        if self._heartbeat is not None:
+            self._heartbeat.__exit__(None, None, None)
+            self._heartbeat = None
+
+    def _teardown_locked(self) -> None:
+        """Idle shutdown once every segment has been consumed."""
+        self._closed = True
+        self._condition.notify_all()
+        # Workers observe the closed flag and exit on their own; do not block
+        # the consumer while they wind down.
+        if self._heartbeat is not None:
+            self._heartbeat.__exit__(None, None, None)
+            self._heartbeat = None

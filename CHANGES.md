@@ -6,6 +6,16 @@ list](https://github.com/trinodb/trino-python-client/tags), the
 [README](https://github.com/trinodb/trino-python-client/blob/master/README.md)
 and the [PyPI page](https://pypi.org/project/trino/).
 
+## Unreleased
+
+* Add an optional bounded prefetch pipeline for spooled segments
+  (`PrefetchConfig`). When enabled, segments are downloaded and decoded in
+  parallel up to a configured concurrency and byte budget, while rows are still
+  delivered in server-side order and segments are acknowledged only after they
+  are consumed. A failed segment is retried on its own and later segments wait
+  in order; cancellation or closing the cursor stops further downloads and
+  releases buffered data.
+
 ## Release 0.340.0
 
 * Fix `AttributeError` when binding `bytes` values for `VARBINARY` columns,

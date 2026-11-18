@@ -167,6 +167,7 @@ class Connection:
         encoding: Union[str, List[str]] = _USE_DEFAULT_ENCODING,
         heartbeat_interval: Optional[float] = constants.DEFAULT_HEARTBEAT_INTERVAL,
         allow_insecure_auth: bool = False,
+        prefetch: Optional[trino.client.PrefetchConfig] = None,
     ):
         # Automatically assign http_schema, port based on hostname
         parsed_host = urlparse(host, allow_fragments=False)
@@ -198,6 +199,7 @@ class Connection:
             timezone=timezone,
             encoding=encoding,
             heartbeat_interval=heartbeat_interval,
+            prefetch=prefetch,
         )
         # mypy cannot follow module import
         if http_session is None:

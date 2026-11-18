@@ -543,6 +543,35 @@ conn = connect(
 )
 ```
 
+### Segment prefetching
+
+When remote segment storage is slow, spooled segments can be downloaded and
+decoded ahead of the consumer by an optional prefetch pipeline. It is disabled
+by default; enable it with a `PrefetchConfig`:
+
+```python
+from trino.client import PrefetchConfig
+from trino.dbapi import connect
+
+conn = connect(
+    encoding="json+zstd",
+    prefetch=PrefetchConfig(
+        enabled=True,
+        max_concurrency=4,        # at most 4 segments downloaded in parallel
+        max_bytes=64 * 1024 * 1024,  # total budget for retained data
+    ),
+)
+```
+
+Rows are always delivered in the server-side order, regardless of which
+download finishes first, and a segment is acknowledged only after it has been
+fully consumed. The pipeline is bounded by both the maximum number of
+concurrent downloads and a byte budget covering the downloaded (compressed)
+and decoded payloads held in memory; a slow consumer back-pressures further
+downloads. If a single segment fails, only that segment is retried while
+successfully downloaded later segments wait in order. Cancelling the query or
+closing the cursor stops further downloads and releases all buffered segments.
+
 ## Transactions
 
 The client runs by default in *autocommit* mode. To enable transactions, set

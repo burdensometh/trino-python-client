@@ -21,6 +21,13 @@ DEFAULT_AUTH: Optional[Any] = None
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_REQUEST_TIMEOUT: float = 30.0
 DEFAULT_HEARTBEAT_INTERVAL: float = 30.0
+# Prefetching of spooled segments is disabled by default. Enabling it only makes
+# sense when remote segment storage is slow compared to the consumer.
+DEFAULT_SEGMENT_PREFETCH_ENABLED: bool = False
+DEFAULT_SEGMENT_PREFETCH_CONCURRENCY: int = 4
+# Default total budget for data retained by the prefetch pipeline (downloaded
+# compressed payloads plus the decompressed/decoded payloads held in memory).
+DEFAULT_SEGMENT_PREFETCH_BYTE_BUDGET: int = 64 * 1024 * 1024
 MAX_NT_PASSWORD_SIZE: int = 1280
 
 HTTP = "http"
